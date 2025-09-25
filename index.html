@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Korean Grammar Coach</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #f8fafc;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .tabular-nums {
+            font-variant-numeric: tabular-nums;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Configuration
+        const AGENT_ID = "agent_5001k5x6hf18fzs8bpph834q4ebg";
+        // ⚠️ NEVER put your API key here in production! See comments below for secure options.
+        const API_KEY = null;
+
+        function VoiceAgentContainer() {
+            const [connected, setConnected] = useState(false);
+            const [speaking, setSpeaking] = useState(false); // user speaking
+            const [status, setStatus] = useState("idle");
+            const [elapsed, setElapsed] = useState(0); // milliseconds
+            const [error, setError] = useState(null);
+
+            // Timer refs
+            const speechStartedRef = useRef(null);
+            const rafRef = useRef(null);
+
+            // Audio + VAD refs
+            const mediaStreamRef = useRef(null);
+            const audioCtxRef = useRef(null);
+            const analyserRef = useRef(null);
+            const sourceRef = useRef(null);
+
+            // ElevenLabs conversation session (lazy)
+            const conversationRef = useRef(null);
+
+            // ====== UTIL: format ms to mm:ss.mmm ======
+            const fmt = (ms) => {
+                const mm = Math.floor(ms / 60000);
+                const ss = Math.floor((ms % 60000) / 1000);
+                const ms3 = Math.floor(ms % 1000).toString().padStart(3, "0");
+                return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
+            };
+
+            // ====== VAD loop (simple RMS threshold) ======
+            const startVadLoop = () => {
+                const analyser = analyserRef.current;
+                if (!analyser) return;
+
+                const data = new Uint8Array(analyser.fftSize);
+                const threshold = 10; // tweak as needed (0..255). ~10 is gentle.
+
+                const loop = () => {
+                    analyser.getByteTimeDomainData(data);
+                    
+                    // RMS
+                    let sum = 0;
+                    for (let i = 0; i < data.length; i++) {
+                        const centered = data[i] - 128;
+                        sum += centered * centered;
+                    }
+                    const rms = Math.sqrt(sum / data.length);
+
+                    // Start timer on first detected speech burst
+                    if (!speaking && rms > threshold) {
+                        setSpeaking(true);
+                        if (!speechStartedRef.current) {
+                            speechStartedRef.current = performance.now();
+                        }
+                    }
+
+                    // If speaking, update the elapsed timer
+                    if (speaking && speechStartedRef.current != null) {
+                        const now = performance.now();
+                        setElapsed(now - speechStartedRef.current);
+                    }
+
+                    rafRef.current = requestAnimationFrame(loop);
+                };
+                rafRef.current = requestAnimationFrame(loop);
+            };
+
+            const stopVadLoop = () => {
+                if (rafRef.current) cancelAnimationFrame(rafRef.current);
+                rafRef.current = null;
+            };
+
+            // ====== Setup audio input + analyser ======
+            const setupAudioChain = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaStreamRef.current = stream;
+
+                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    audioCtxRef.current = ctx;
+
+                    const analyser = ctx.createAnalyser();
+                    analyser.fftSize = 1024; // fine for VAD
+                    analyserRef.current = analyser;
+
+                    const src = ctx.createMediaStreamSource(stream);
+                    sourceRef.current = src;
+                    src.connect(analyser);
+
+                    startVadLoop();
+                } catch (e) {
+                    throw new Error(`Microphone access failed: ${e.message}`);
+                }
+            };
+
+            const teardownAudioChain = () => {
+                stopVadLoop();
+                if (sourceRef.current) sourceRef.current.disconnect();
+                if (analyserRef.current) analyserRef.current.disconnect();
+                if (mediaStreamRef.current) {
+                    mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+                }
+                mediaStreamRef.current = null;
+                if (audioCtxRef.current) audioCtxRef.current.close();
+                audioCtxRef.current = null;
+                setSpeaking(false);
+                speechStartedRef.current = null;
+                setElapsed(0);
+            };
+
+            // ====== Load ElevenLabs SDK dynamically ======
+            const loadElevenLabsSDK = async () => {
+                if (window.ElevenLabsClient) return window.ElevenLabsClient;
+                
+                return new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.12.0/dist/index.umd.js';
+                    script.onload = () => {
+                        if (window.ElevenLabsClient) {
+                            resolve(window.ElevenLabsClient);
+                        } else {
+                            reject(new Error('ElevenLabs SDK failed to load'));
+                        }
+                    };
+                    script.onerror = () => reject(new Error('Failed to load ElevenLabs SDK'));
+                    document.head.appendChild(script);
+                });
+            };
+
+            // ====== ElevenLabs Start/Stop ======
+            const handleStart = async () => {
+                setError(null);
+                setStatus("requesting-mic");
+
+                try {
+                    // First setup audio
+                    await setupAudioChain();
+                    setStatus("loading-sdk");
+
+                    // Then load and connect to ElevenLabs
+                    try {
+                        const ElevenLabs = await loadElevenLabsSDK();
+                        setStatus("connecting");
+
+                        // Try to start session
+                        const sessionConfig = {
+                            agentId: AGENT_ID,
+                            connectionType: "webrtc",
+                        };
+
+                        // Add API key if provided (⚠️ INSECURE for production!)
+                        if (API_KEY) {
+                            sessionConfig.apiKey = API_KEY;
+                        }
+
+                        const session = await ElevenLabs.Conversation.startSession(sessionConfig);
+
+                        conversationRef.current = session;
+                        setConnected(true);
+                        setStatus("connected");
+
+                    } catch (sdkError) {
+                        console.warn('ElevenLabs connection failed:', sdkError);
+                        setStatus("mock-mode");
+                        setConnected(true);
+                        setError(`ElevenLabs connection failed: ${sdkError.message}. Running in demo mode - timer and mic detection still work.`);
+                    }
+
+                } catch (e) {
+                    console.error('Setup failed:', e);
+                    setError(e?.message || String(e));
+                    setStatus("error");
+                    teardownAudioChain();
+                }
+            };
+
+            const handleStop = async () => {
+                try {
+                    setStatus("stopping");
+                    const session = conversationRef.current;
+                    if (session && typeof session.stopSession === 'function') {
+                        try {
+                            await session.stopSession();
+                        } catch (e) {
+                            console.warn('Error stopping session:', e);
+                        }
+                        conversationRef.current = null;
+                    }
+                } finally {
+                    teardownAudioChain();
+                    setConnected(false);
+                    setStatus("idle");
+                    setError(null);
+                }
+            };
+
+            return (
+                <div className="w-full max-w-md mx-auto p-4">
+                    <div className="rounded-3xl border border-gray-200 shadow-sm p-5 bg-white">
+                        <div className="flex items-center justify-between mb-4">
+                            <h1 className="text-lg font-semibold tracking-tight">Korean Grammar Coach</h1>
+                            <span className={`text-xs px-2 py-1 rounded-full ${
+                                connected ? "bg-emerald-50 text-emerald-700" :
+                                status === "connecting" || status === "requesting-mic" || status === "loading-sdk" ? "bg-amber-50 text-amber-700" :
+                                status === "error" ? "bg-rose-50 text-rose-700" :
+                                status === "mock-mode" ? "bg-blue-50 text-blue-700" :
+                                "bg-gray-50 text-gray-600"
+                            }`}>
+                                {status.replace('-', ' ')}
+                            </span>
+                        </div>
+
+                        <div className="flex flex-col items-center gap-3 py-6">
+                            {/* Timer */}
+                            <div className="text-4xl tabular-nums font-mono">
+                                {fmt(elapsed)}
+                            </div>
+
+                            <div className="text-xs text-gray-500">
+                                {speaking ? "listening… timer running" : "timer will start when you speak"}
+                            </div>
+
+                            {/* Controls */}
+                            <div className="flex gap-3 mt-4">
+                                {!connected ? (
+                                    <button 
+                                        onClick={handleStart}
+                                        className="px-4 py-2 rounded-2xl border border-gray-300 hover:bg-gray-50 active:scale-[.99] transition-transform"
+                                        disabled={status === "requesting-mic" || status === "loading-sdk" || status === "connecting"}
+                                    >
+                                        {status === "requesting-mic" ? "Allow Mic..." :
+                                         status === "loading-sdk" ? "Loading..." :
+                                         status === "connecting" ? "Connecting..." :
+                                         "Start"}
+                                    </button>
+                                ) : (
+                                    <button 
+                                        onClick={handleStop}
+                                        className="px-4 py-2 rounded-2xl border border-gray-300 hover:bg-gray-50 active:scale-[.99] transition-transform"
+                                    >
+                                        Stop
+                                    </button>
+                                )}
+                            </div>
+
+                            {/* Mic visualizer */}
+                            <MicDot analyser={analyserRef.current} />
+                        </div>
+
+                        {error && (
+                            <div className="text-sm text-rose-600 border-t pt-4">
+                                {error}
+                            </div>
+                        )}
+
+                        <div className="mt-4 text-[11px] text-gray-500 leading-relaxed">
+                            <strong>Security Note:</strong> This demo has your agent ID hardcoded. For production:
+                            <br />• Make your agent PUBLIC (no API key needed), OR
+                            <br />• Create a backend API that generates conversation tokens
+                            <br />• Never expose API keys in client-side code!
+                        </div>
+                    </div>
+
+                    <div className="text-[11px] text-gray-400 mt-3 text-center">
+                        Built for @askcalvinoppa · Minimal container · Timer starts on speech
+                    </div>
+                </div>
+            );
+        }
+
+        function MicDot({ analyser }) {
+            const [r, setR] = useState(6);
+
+            useEffect(() => {
+                if (!analyser) return;
+
+                let raf;
+                const data = new Uint8Array(analyser.fftSize);
+
+                const loop = () => {
+                    analyser.getByteTimeDomainData(data);
+                    
+                    let sum = 0;
+                    for (let i = 0; i < data.length; i++) {
+                        const centered = data[i] - 128;
+                        sum += centered * centered;
+                    }
+                    const rms = Math.sqrt(sum / data.length);
+                    
+                    // ~0..128
+                    const radius = 6 + Math.min(18, rms / 3);
+                    setR(radius);
+                    
+                    raf = requestAnimationFrame(loop);
+                };
+                
+                raf = requestAnimationFrame(loop);
+                return () => cancelAnimationFrame(raf);
+            }, [analyser]);
+
+            return (
+                <div className="mt-2 h-8 flex items-center justify-center">
+                    <div 
+                        aria-hidden
+                        className="rounded-full transition-all duration-75"
+                        style={{
+                            width: r * 2,
+                            height: r * 2,
+                            background: "#111",
+                            opacity: 0.8
+                        }}
+                    />
+                </div>
+            );
+        }
+
+        // Render the app
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<VoiceAgentContainer />);
+    </script>
+</body>
+</html>
