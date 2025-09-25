@@ -11,10 +11,30 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- ElevenLabs SDK (ESM) -->
+  <!-- ElevenLabs SDK (ESM) with multi-CDN fallback -->
   <script type="module">
-    import * as Eleven from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.12.0/+esm";
-    window.ElevenLabs = Eleven; // expose for Babel script below
+    const candidates = [
+      // unpkg ESM transform
+      "https://unpkg.com/@elevenlabs/client@0.12.0?module",
+      // JSPM direct ESM
+      "https://ga.jspm.io/npm:@elevenlabs/client@0.12.0/dist/index.js",
+      // Skypack ESM
+      "https://cdn.skypack.dev/@elevenlabs/client@0.12.0"
+    ];
+    let Eleven = null;
+    for (const url of candidates) {
+      try {
+        Eleven = await import(url);
+        window.ElevenLabs = Eleven;
+        console.log("[SDK] Loaded ElevenLabs from", url);
+        break;
+      } catch (e) {
+        console.warn("[SDK] Failed from", url, e);
+      }
+    }
+    if (!window.ElevenLabs) {
+      console.error("[SDK] Could not load ElevenLabs SDK from any CDN.");
+    }
   </script>
 
   <style>
