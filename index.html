@@ -11,10 +11,10 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- Robust SDK loader: tries multiple CDNs/versions and sets window.ElevenLabs -->
+  <!-- Robust ElevenLabs SDK loader: tries multiple CDNs/versions and sets window.ElevenLabs -->
   <script type="module">
     window.loadElevenLabsSDK = async function loadElevenLabsSDK() {
-      if (window.ElevenLabs) return window.ElevenLabs;
+      if (window.ElevenLabs?.Conversation?.startSession) return window.ElevenLabs;
 
       // Known-working builds (try ESM first, then UMD)
       const candidates = [
@@ -31,8 +31,9 @@
         if (url.endsWith(".umd.js")) return false; // skip import for UMD
         try {
           const mod = await import(url);
-          window.ElevenLabs = mod || window.ElevenLabs;
-          return !!window.ElevenLabs;
+          // some builds export default; some export namespace
+          window.ElevenLabs = mod?.default || mod || window.ElevenLabs;
+          return !!(window.ElevenLabs?.Conversation?.startSession);
         } catch {
           return false;
         }
@@ -44,8 +45,8 @@
         s.async = true;
         s.onload = () => {
           // Older UMDs exposed different globals; check all
-          window.ElevenLabs = window.ElevenLabs || window.ElevenLabsClient || window.Eleven;
-          resolve(!!window.ElevenLabs);
+          window.ElevenLabs = window.ElevenLabs || window.ElevenLabsClient || window.Eleven || window.Elevenlabs;
+          resolve(!!(window.ElevenLabs?.Conversation?.startSession));
         };
         s.onerror = () => resolve(false);
         document.head.appendChild(s);
@@ -54,7 +55,7 @@
       for (const url of candidates) {
         let ok = await tryImport(url);
         if (!ok && url.endsWith(".umd.js")) ok = await tryScript(url);
-        if (ok && window.ElevenLabs?.Conversation?.startSession) {
+        if (ok) {
           console.log("[SDK] Loaded ElevenLabs from", url);
           return window.ElevenLabs;
         }
@@ -81,7 +82,7 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // Your Render backend token endpoint
+    // === CONFIG ===
     const TOKEN_ENDPOINT = "https://token-server-omrd.onrender.com/api/webrtc-token";
 
     function VoiceAgentContainer() {
@@ -96,7 +97,7 @@
       const rafRef           = useRef(null);
       const speakingRef      = useRef(false);
 
-      // Audio refs
+      // Audio refs (for our analyser/timer only)
       const mediaStreamRef = useRef(null);
       const audioCtxRef    = useRef(null);
       const analyserRef    = useRef(null);
@@ -113,49 +114,49 @@
         return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
       };
 
-  // ====== VAD loop (start-once + continuous timer) ======
-const startVadLoop = () => {
-  const analyser = analyserRef.current;
-  if (!analyser) return;
+      // ====== VAD loop (start-once + continuous timer) ======
+      const startVadLoop = () => {
+        const analyser = analyserRef.current;
+        if (!analyser) return;
 
-  const data = new Float32Array(analyser.fftSize);
-  const onThreshold  = 0.03;  // ~3% RMS
+        const data = new Float32Array(analyser.fftSize);
+        const onThreshold  = 0.03;  // ~3% RMS
 
-  const loop = () => {
-    analyser.getFloatTimeDomainData(data);
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-    const rms = Math.sqrt(sum / data.length);
+        const loop = () => {
+          analyser.getFloatTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+          const rms = Math.sqrt(sum / data.length);
 
-    // Start the timer the FIRST time we detect voice
-    if (!speakingRef.current && rms > onThreshold) {
-      speakingRef.current = true;
-      setSpeaking(true);
-      if (!speechStartedRef.current) {
-        speechStartedRef.current = performance.now();
-      }
-    }
+          // Start the timer the FIRST time we detect voice
+          if (!speakingRef.current && rms > onThreshold) {
+            speakingRef.current = true;
+            setSpeaking(true);
+            if (!speechStartedRef.current) {
+              speechStartedRef.current = performance.now();
+            }
+          }
 
-    // Once started, keep timer running continuously
-    if (speechStartedRef.current != null) {
-      const now = performance.now();
-      setElapsed(now - speechStartedRef.current);
-    }
+          // Once started, keep timer running continuously
+          if (speechStartedRef.current != null) {
+            const now = performance.now();
+            setElapsed(now - speechStartedRef.current);
+          }
 
-    // (We no longer set speaking=false on quiet — mic dot still animates fine)
-    rafRef.current = requestAnimationFrame(loop);
-  };
+          rafRef.current = requestAnimationFrame(loop);
+        };
 
-  rafRef.current = requestAnimationFrame(loop);
-};
-
+        rafRef.current = requestAnimationFrame(loop);
+      };
 
       const stopVadLoop = () => {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       };
 
+      // Our analyser-only mic (separate from ElevenLabs internal mic)
       const setupAudioChain = async () => {
+        // keep constraints simple to avoid device contention
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         mediaStreamRef.current = stream;
 
@@ -194,51 +195,62 @@ const startVadLoop = () => {
         setElapsed(0);
       };
 
-const handleStart = async () => {
-  setError(null);
-  setStatus("requesting-mic");
+      // ===== Start / Stop =====
+      const handleStart = async () => {
+        setError(null);
+        setStatus("requesting-mic");
 
-  try {
-    // ✅ 1) Load SDK *before* we touch the mic, so we can let SDK own it
-    setStatus("loading-sdk");
-    const Eleven = await window.loadElevenLabsSDK();
-    if (!Eleven?.Conversation?.startSession) {
-      throw new Error("ElevenLabs SDK loaded but Conversation.startSession is missing");
-    }
+        try {
+          // 0) Start analyser mic FIRST so the timer always runs (even if session fails)
+          await setupAudioChain();
 
-    // ✅ 2) Get token
-    setStatus("getting-token");
-    const resp = await fetch(TOKEN_ENDPOINT);
-    if (!resp.ok) {
-      const t = await resp.text();
-      throw new Error(`Token endpoint error (${resp.status}): ${t}`);
-    }
-    const { token } = await resp.json();
-    if (!token) throw new Error("Token payload missing { token }");
+          // 1) Load SDK
+          setStatus("loading-sdk");
+          const Eleven = await window.loadElevenLabsSDK();
+          if (!Eleven?.Conversation?.startSession) {
+            throw new Error("ElevenLabs SDK loaded but Conversation.startSession is missing");
+          }
 
-    // ✅ 3) Start WebRTC session (let SDK open mic itself)
-    setStatus("connecting");
-    const session = await Eleven.Conversation.startSession({
-      connectionType: "webrtc",
-      conversationToken: token,
-      // Some SDK builds accept this flag; harmless if ignored:
-      enableMicrophone: true
-    });
+          // 2) Get token
+          setStatus("getting-token");
+          const resp = await fetch(TOKEN_ENDPOINT, { mode: "cors" });
+          if (!resp.ok) {
+            const t = await resp.text();
+            throw new Error(`Token endpoint error (${resp.status}): ${t}`);
+          }
+          const data = await resp.json();
+          console.log("[token-server] payload:", data);
+          const { token } = data;
+          if (!token) throw new Error("Token payload missing { token }");
 
-    conversationRef.current = session;
+          // 3) Start WebRTC session (SDK controls its own mic)
+          setStatus("connecting");
+          const session = await Eleven.Conversation.startSession({
+            connectionType: "webrtc",
+            conversationToken: token,
+            enableMicrophone: true
+          });
 
-    // ✅ 4) Now create *your own* analyser mic for the dot/timer (does not affect SDK)
-    await setupAudioChain();
+          // Optional: logs for debugging
+          session.onStatusChange?.((s) => console.log("[sdk] status:", s));
+          session.onError?.((err) => console.error("[sdk] error:", err));
 
-    setConnected(true);
-    setStatus("connected");
-  } catch (e) {
-    console.warn("Start failed:", e);
-    setStatus("mock-mode");
-    setConnected(true); // keep UI usable
-    setError(e.message || String(e));
-  }
-};
+          conversationRef.current = session;
+
+          setConnected(true);
+          setStatus("connected");
+        } catch (e) {
+          // Turn a CloseEvent into a readable message
+          let msg = e?.message || String(e);
+          if (e && typeof e === "object" && e.type === "close") {
+            msg = `WebRTC signaling closed (code=${e.code}, reason=${e.reason || "n/a"})`;
+          }
+          console.warn("Start failed:", e);
+          setStatus("mock-mode");
+          setConnected(true); // keep UI usable
+          setError(msg);
+        }
+      };
 
       const handleStop = async () => {
         try {
@@ -360,15 +372,15 @@ const handleStart = async () => {
         return () => cancelAnimationFrame(raf);
       }, [analyser]);
 
-return (
-  <div className="mt-2 h-8 flex items-center justify-center">
-    <div
-      aria-hidden
-      className="rounded-full transition-all duration-75"
-      style={{ width: r * 2, height: r * 2, background: "#111", opacity: 0.8 }}
-    />
-  </div>
-);
+      return (
+        <div className="mt-2 h-8 flex items-center justify-center">
+          <div
+            aria-hidden
+            className="rounded-full transition-all duration-75"
+            style={{ width: r * 2, height: r * 2, background: "#111", opacity: 0.8 }}
+          />
+        </div>
+      );
     }
 
     const root = ReactDOM.createRoot(document.getElementById('root'));
