@@ -1,355 +1,329 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Korean Grammar Coach</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Korean Grammar Coach</title>
 
-    <script type="module">
-      import * as Eleven from "https://esm.sh/@elevenlabs/client@0.12.0";
-      window.ElevenLabs = Eleven; // expose for your Babel code
-    </script>
-    <style>
-        body {
-            margin: 0;
-            padding: 20px;
-            background: #f8fafc;
-            font-family: system-ui, -apple-system, sans-serif;
-        }
-        .tabular-nums {
-            font-variant-numeric: tabular-nums;
-        }
-    </style>
+  <!-- React + Babel + Tailwind -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- ElevenLabs SDK (ESM) -->
+  <script type="module">
+    import * as Eleven from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.12.0/+esm";
+    window.ElevenLabs = Eleven; // expose for Babel script below
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #f8fafc;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+  </style>
 </head>
 <body>
-    <div id="root"></div>
+  <div id="root"></div>
 
-    <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
 
-        // Configuration
-        const AGENT_ID = "agent_5001k5x6hf18fzs8bpph834q4ebg"; // This is safe to expose
+    function VoiceAgentContainer() {
+      const [connected, setConnected] = useState(false);
+      const [speaking, setSpeaking]   = useState(false);
+      const [status, setStatus]       = useState("idle");
+      const [elapsed, setElapsed]     = useState(0);
+      const [error, setError]         = useState(null);
 
-        function VoiceAgentContainer() {
-            const [connected, setConnected] = useState(false);
-            const [speaking, setSpeaking] = useState(false); // user speaking
-            const [status, setStatus] = useState("idle");
-            const [elapsed, setElapsed] = useState(0); // milliseconds
-            const [error, setError] = useState(null);
+      // Refs
+      const speechStartedRef = useRef(null);
+      const rafRef           = useRef(null);
+      const speakingRef      = useRef(false);
 
-            // Timer refs
-            const speechStartedRef = useRef(null);
-            const rafRef = useRef(null);
-            const speakingRef = useRef(false);
+      // Audio refs
+      const mediaStreamRef = useRef(null);
+      const audioCtxRef    = useRef(null);
+      const analyserRef    = useRef(null);
+      const sourceRef      = useRef(null);
 
-            // Audio + VAD refs
-            const mediaStreamRef = useRef(null);
-            const audioCtxRef = useRef(null);
-            const analyserRef = useRef(null);
-            const sourceRef = useRef(null);
+      // ElevenLabs session
+      const conversationRef = useRef(null);
 
-            // ElevenLabs conversation session (lazy)
-            const conversationRef = useRef(null);
+      // Format ms → mm:ss.mmm
+      const fmt = (ms) => {
+        const mm  = Math.floor(ms / 60000);
+        const ss  = Math.floor((ms % 60000) / 1000);
+        const ms3 = Math.floor(ms % 1000).toString().padStart(3, "0");
+        return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
+      };
 
-            // ====== UTIL: format ms to mm:ss.mmm ======
-            const fmt = (ms) => {
-                const mm = Math.floor(ms / 60000);
-                const ss = Math.floor((ms % 60000) / 1000);
-                const ms3 = Math.floor(ms % 1000).toString().padStart(3, "0");
-                return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
-            };
+      // Simple VAD with hysteresis
+      const startVadLoop = () => {
+        const analyser = analyserRef.current;
+        if (!analyser) return;
 
-            // ====== VAD loop (simple RMS with hysteresis) ======
-            const startVadLoop = () => {
-                const analyser = analyserRef.current;
-                if (!analyser) return;
+        const data = new Float32Array(analyser.fftSize);
+        const onThreshold  = 0.03;  // ~3% RMS
+        const offThreshold = 0.015; // lower to avoid flapping
 
-                const data = new Float32Array(analyser.fftSize);
-                const onThreshold = 0.03;   // ~3% RMS
-                const offThreshold = 0.015; // lower to avoid flapping
+        const loop = () => {
+          analyser.getFloatTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+          const rms = Math.sqrt(sum / data.length);
 
-                const loop = () => {
-                    analyser.getFloatTimeDomainData(data);
-                    let sum = 0;
-                    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-                    const rms = Math.sqrt(sum / data.length);
+          if (!speakingRef.current && rms > onThreshold) {
+            speakingRef.current = true;
+            setSpeaking(true);
+            if (!speechStartedRef.current) speechStartedRef.current = performance.now();
+          }
 
-                    // start on voice
-                    if (!speakingRef.current && rms > onThreshold) {
-                        speakingRef.current = true;
-                        setSpeaking(true);
-                        if (!speechStartedRef.current) speechStartedRef.current = performance.now();
-                    }
+          if (speakingRef.current && rms < offThreshold) {
+            speakingRef.current = false;
+            setSpeaking(false);
+          }
 
-                    // optional: stop when quiet
-                    if (speakingRef.current && rms < offThreshold) {
-                        speakingRef.current = false;
-                        setSpeaking(false);
-                    }
+          if (speakingRef.current && speechStartedRef.current != null) {
+            const now = performance.now();
+            setElapsed(now - speechStartedRef.current);
+          }
 
-                    // If speaking, update the elapsed timer (use ref, not state!)
-                    if (speakingRef.current && speechStartedRef.current != null) {
-                        const now = performance.now();
-                        setElapsed(now - speechStartedRef.current);
-                    }
+          rafRef.current = requestAnimationFrame(loop);
+        };
 
-                    rafRef.current = requestAnimationFrame(loop);
-                };
-                rafRef.current = requestAnimationFrame(loop);
-            };
+        rafRef.current = requestAnimationFrame(loop);
+      };
 
-            const stopVadLoop = () => {
-                if (rafRef.current) cancelAnimationFrame(rafRef.current);
-                rafRef.current = null;
-            };
+      const stopVadLoop = () => {
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      };
 
-            // ====== Setup audio input + analyser ======
-            const setupAudioChain = async () => {
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    mediaStreamRef.current = stream;
+      // Audio chain
+      const setupAudioChain = async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaStreamRef.current = stream;
 
-                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                    audioCtxRef.current = ctx;
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          const ctx = new Ctx();
+          audioCtxRef.current = ctx;
 
-                    // Important on Safari / suspended contexts:
-                    if (ctx.state === "suspended") {
-                        await ctx.resume();
-                    }
+          if (ctx.state === "suspended") await ctx.resume();
 
-                    const analyser = ctx.createAnalyser();
-                    analyser.fftSize = 1024; // fine for VAD
-                    analyserRef.current = analyser;
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 1024;
+          analyserRef.current = analyser;
 
-                    const src = ctx.createMediaStreamSource(stream);
-                    sourceRef.current = src;
-                    src.connect(analyser);
+          const src = ctx.createMediaStreamSource(stream);
+          sourceRef.current = src;
+          src.connect(analyser);
 
-                    startVadLoop();
-                } catch (e) {
-                    throw new Error(`Microphone access failed: ${e.message}`);
-                }
-            };
-
-            const teardownAudioChain = () => {
-                stopVadLoop();
-                if (sourceRef.current) sourceRef.current.disconnect();
-                if (analyserRef.current) analyserRef.current.disconnect();
-                if (mediaStreamRef.current) {
-                    mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-                }
-                mediaStreamRef.current = null;
-                if (audioCtxRef.current) audioCtxRef.current.close();
-                audioCtxRef.current = null;
-                speakingRef.current = false; // keep ref in sync
-                setSpeaking(false);
-                speechStartedRef.current = null;
-                setElapsed(0);
-            };
-
-            // ====== ElevenLabs Start/Stop ======
-            const handleStart = async () => {
-                setError(null);
-                setStatus("requesting-mic");
-
-                try {
-                    // First setup audio
-                    await setupAudioChain();
-                    setStatus("loading-sdk");
-
-                    // Then load and connect to ElevenLabs
-                    try {
-                        const ElevenLabs = await loadElevenLabsSDK();
-                        setStatus("getting-token");
-
-                        // Get conversation token from secure backend
-                        const tokenResponse = await fetch('/api/conversation-token', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            }
-                        });
-
-                        if (!tokenResponse.ok) {
-                            const errorData = await tokenResponse.json();
-                            throw new Error(errorData.error || 'Failed to get conversation token');
-                        }
-
-                        const { signed_url } = await tokenResponse.json();
-                        setStatus("connecting");
-
-                        // Start session with signed URL - NO API KEY NEEDED!
-                        const session = await ElevenLabs.Conversation.startSession({
-                            signedUrl: signed_url,
-                            connectionType: "webrtc"
-                        });
-
-                        conversationRef.current = session;
-                        setConnected(true);
-                        setStatus("connected");
-
-                    } catch (sdkError) {
-                        console.warn('ElevenLabs connection failed:', sdkError);
-                        setStatus("mock-mode");
-                        setConnected(true);
-                        setError(`Connection failed: ${sdkError.message}. Running in demo mode - timer and mic detection still work.`);
-                    }
-
-                } catch (e) {
-                    console.error('Setup failed:', e);
-                    setError(e?.message || String(e));
-                    setStatus("error");
-                    teardownAudioChain();
-                }
-            };
-
-            const handleStop = async () => {
-                try {
-                    setStatus("stopping");
-                    const session = conversationRef.current;
-                    if (session && typeof session.stopSession === 'function') {
-                        try {
-                            await session.stopSession();
-                        } catch (e) {
-                            console.warn('Error stopping session:', e);
-                        }
-                        conversationRef.current = null;
-                    }
-                } finally {
-                    teardownAudioChain();
-                    setConnected(false);
-                    setStatus("idle");
-                    setError(null);
-                }
-            };
-
-            return (
-                <div className="w-full max-w-md mx-auto p-4">
-                    <div className="rounded-3xl border border-gray-200 shadow-sm p-5 bg-white">
-                        <div className="flex items-center justify-between mb-4">
-                            <h1 className="text-lg font-semibold tracking-tight">Korean Grammar Coach</h1>
-                            <span className={`text-xs px-2 py-1 rounded-full ${
-                                connected ? "bg-emerald-50 text-emerald-700" :
-                                status === "connecting" || status === "requesting-mic" || status === "loading-sdk" || status === "getting-token" ? "bg-amber-50 text-amber-700" :
-                                status === "error" ? "bg-rose-50 text-rose-700" :
-                                status === "mock-mode" ? "bg-blue-50 text-blue-700" :
-                                "bg-gray-50 text-gray-600"
-                            }`}>
-                                {status.replace('-', ' ')}
-                            </span>
-                        </div>
-
-                        <div className="flex flex-col items-center gap-3 py-6">
-                            {/* Timer */}
-                            <div className="text-4xl tabular-nums font-mono">
-                                {fmt(elapsed)}
-                            </div>
-
-                            <div className="text-xs text-gray-500">
-                                {speaking ? "listening… timer running" : "timer will start when you speak"}
-                            </div>
-
-                            {/* Controls */}
-                            <div className="flex gap-3 mt-4">
-                                {!connected ? (
-                                    <button 
-                                        onClick={handleStart}
-                                        className="px-4 py-2 rounded-2xl border border-gray-300 hover:bg-gray-50 active:scale-[.99] transition-transform"
-                                        disabled={status === "requesting-mic" || status === "loading-sdk" || status === "getting-token" || status === "connecting"}
-                                    >
-                                        {status === "requesting-mic" ? "Allow Mic..." :
-                                         status === "loading-sdk" ? "Loading..." :
-                                         status === "getting-token" ? "Getting Token..." :
-                                         status === "connecting" ? "Connecting..." :
-                                         "Start"}
-                                    </button>
-                                ) : (
-                                    <button 
-                                        onClick={handleStop}
-                                        className="px-4 py-2 rounded-2xl border border-gray-300 hover:bg-gray-50 active:scale-[.99] transition-transform"
-                                    >
-                                        Stop
-                                    </button>
-                                )}
-                            </div>
-
-                            {/* Mic visualizer */}
-                            <MicDot analyser={analyserRef.current} />
-                        </div>
-
-                        {error && (
-                            <div className="text-sm text-rose-600 border-t pt-4">
-                                {error}
-                            </div>
-                        )}
-
-                        <div className="mt-4 text-[11px] text-gray-500 leading-relaxed">
-                            <strong>Secure Setup:</strong> This app uses a secure token server at token-server-omrd.onrender.com
-                            <br />• API keys are safely stored on the server
-                            <br />• Temporary tokens expire automatically
-                            <br />• No sensitive credentials in browser code!
-                        </div>
-                    </div>
-
-                    <div className="text-[11px] text-gray-400 mt-3 text-center">
-                        Built for @askcalvinoppa · Minimal container · Timer starts on speech
-                    </div>
-                </div>
-            );
+          startVadLoop();
+        } catch (e) {
+          throw new Error(`Microphone access failed: ${e.message}`);
         }
+      };
 
-        function MicDot({ analyser }) {
-            const [r, setR] = useState(6);
-
-            useEffect(() => {
-                if (!analyser) return;
-
-                let raf;
-                const data = new Float32Array(analyser.fftSize);
-
-                const loop = () => {
-                    analyser.getFloatTimeDomainData(data);
-                    
-                    let sum = 0;
-                    for (let i = 0; i < data.length; i++) {
-                        sum += data[i] * data[i];
-                    }
-                    const rms = Math.sqrt(sum / data.length);
-                    
-                    // Scale RMS for visual feedback (0..1 range now)
-                    const radius = 6 + Math.min(18, rms * 600);
-                    setR(radius);
-                    
-                    raf = requestAnimationFrame(loop);
-                };
-                
-                raf = requestAnimationFrame(loop);
-                return () => cancelAnimationFrame(raf);
-            }, [analyser]);
-
-            return (
-                <div className="mt-2 h-8 flex items-center justify-center">
-                    <div 
-                        aria-hidden
-                        className="rounded-full transition-all duration-75"
-                        style={{
-                            width: r * 2,
-                            height: r * 2,
-                            background: "#111",
-                            opacity: 0.8
-                        }}
-                    />
-                </div>
-            );
+      const teardownAudioChain = () => {
+        stopVadLoop();
+        try { sourceRef.current?.disconnect(); } catch {}
+        try { analyserRef.current?.disconnect(); } catch {}
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+          mediaStreamRef.current = null;
         }
+        if (audioCtxRef.current) {
+          try { audioCtxRef.current.close(); } catch {}
+          audioCtxRef.current = null;
+        }
+        speakingRef.current = false;
+        setSpeaking(false);
+        speechStartedRef.current = null;
+        setElapsed(0);
+      };
 
-        // Render the app
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<VoiceAgentContainer />);
-    </script>
+      // ===== Start / Stop =====
+      const handleStart = async () => {
+        setError(null);
+        setStatus("requesting-mic");
+
+        try {
+          // 1) Mic
+          await setupAudioChain();
+          setStatus("loading-sdk");
+
+          // 2) SDK from <head>
+          const Eleven = window.ElevenLabs;
+          if (!Eleven) {
+            throw new Error("ElevenLabs SDK not present (check the <script type='module'> in <head>)");
+          }
+
+          // 3) Token from your Render backend (USE YOUR URL)
+          setStatus("getting-token");
+          const { token } = await fetch("https://token-server-omrd.onrender.com/api/webrtc-token")
+            .then(r => r.json());
+
+          // 4) Start WebRTC session with token
+          setStatus("connecting");
+          const session = await Eleven.Conversation.startSession({
+            connectionType: "webrtc",
+            conversationToken: token
+          });
+
+          conversationRef.current = session;
+          setConnected(true);
+          setStatus("connected");
+        } catch (sdkError) {
+          console.warn("ElevenLabs connection failed:", sdkError);
+          setStatus("mock-mode");
+          setConnected(true);
+          setError(`Connection failed: ${sdkError.message}. Running in demo mode - timer and mic detection still work.`);
+        }
+      };
+
+      const handleStop = async () => {
+        try {
+          setStatus("stopping");
+          const session = conversationRef.current;
+          if (session) {
+            try {
+              if (typeof session.endSession === "function") {
+                await session.endSession();
+              } else if (typeof session.stopSession === "function") {
+                await session.stopSession();
+              }
+            } catch (e) {
+              console.warn("Error stopping session:", e);
+            }
+            conversationRef.current = null;
+          }
+        } finally {
+          teardownAudioChain();
+          setConnected(false);
+          setStatus("idle");
+          setError(null);
+        }
+      };
+
+      return (
+        <div className="w-full max-w-md mx-auto p-4">
+          <div className="rounded-3xl border border-gray-200 shadow-sm p-5 bg-white">
+            <div className="flex items-center justify-between mb-4">
+              <h1 className="text-lg font-semibold tracking-tight">Korean Grammar Coach</h1>
+              <span className={`text-xs px-2 py-1 rounded-full ${
+                connected ? "bg-emerald-50 text-emerald-700" :
+                status === "connecting" || status === "requesting-mic" || status === "loading-sdk" || status === "getting-token" ? "bg-amber-50 text-amber-700" :
+                status === "error" ? "bg-rose-50 text-rose-700" :
+                status === "mock-mode" ? "bg-blue-50 text-blue-700" :
+                "bg-gray-50 text-gray-600"
+              }`}>
+                {status.replace('-', ' ')}
+              </span>
+            </div>
+
+            <div className="flex flex-col items-center gap-3 py-6">
+              {/* Timer */}
+              <div className="text-4xl tabular-nums font-mono">{fmt(elapsed)}</div>
+
+              <div className="text-xs text-gray-500">
+                {speaking ? "listening… timer running" : "timer will start when you speak"}
+              </div>
+
+              {/* Controls */}
+              <div className="flex gap-3 mt-4">
+                {!connected ? (
+                  <button
+                    onClick={handleStart}
+                    className="px-4 py-2 rounded-2xl border border-gray-300 hover:bg-gray-50 active:scale-[.99] transition-transform"
+                    disabled={status === "requesting-mic" || status === "loading-sdk" || status === "getting-token" || status === "connecting"}
+                  >
+                    {status === "requesting-mic" ? "Allow Mic..." :
+                     status === "loading-sdk" ? "Loading..." :
+                     status === "getting-token" ? "Getting Token..." :
+                     status === "connecting" ? "Connecting..." :
+                     "Start"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleStop}
+                    className="px-4 py-2 rounded-2xl border border-gray-300 hover:bg-gray-50 active:scale-[.99] transition-transform"
+                  >
+                    Stop
+                  </button>
+                )}
+              </div>
+
+              {/* Mic visualizer */}
+              <MicDot analyser={analyserRef.current} />
+            </div>
+
+            {error && (
+              <div className="text-sm text-rose-600 border-t pt-4">
+                {error}
+              </div>
+            )}
+
+            <div className="mt-4 text-[11px] text-gray-500 leading-relaxed">
+              <strong>Secure Setup:</strong> This app uses a secure token server at token-server-omrd.onrender.com
+              <br />• API keys are safely stored on the server
+              <br />• Temporary tokens expire automatically
+              <br />• No sensitive credentials in browser code!
+            </div>
+          </div>
+
+          <div className="text-[11px] text-gray-400 mt-3 text-center">
+            Built for @askcalvinoppa · Minimal container · Timer starts on speech
+          </div>
+        </div>
+      );
+    }
+
+    function MicDot({ analyser }) {
+      const [r, setR] = useState(6);
+
+      useEffect(() => {
+        if (!analyser) return;
+
+        let raf;
+        const data = new Float32Array(analyser.fftSize);
+
+        const loop = () => {
+          analyser.getFloatTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+          const rms = Math.sqrt(sum / data.length);
+
+          // Visual scale (0..1-ish)
+          const radius = 6 + Math.min(18, rms * 600);
+          setR(radius);
+
+          raf = requestAnimationFrame(loop);
+        };
+
+        raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+      }, [analyser]);
+
+      return (
+        <div className="mt-2 h-8 flex items-center justify-center">
+          <div
+            aria-hidden
+            className="rounded-full transition-all duration-75"
+            style={{ width: r * 2, height: r * 2, background: "#111", opacity: 0.8 }}
+          />
+        </div>
+      );
+    }
+
+    // Render app
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<VoiceAgentContainer />);
+  </script>
 </body>
 </html>
