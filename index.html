@@ -211,25 +211,22 @@
             throw new Error("ElevenLabs SDK loaded but Conversation.startSession is missing");
           }
 
-          // 2) Get token
-          setStatus("getting-token");
-          const resp = await fetch(TOKEN_ENDPOINT, { mode: "cors" });
-          if (!resp.ok) {
-            const t = await resp.text();
-            throw new Error(`Token endpoint error (${resp.status}): ${t}`);
-          }
-          const data = await resp.json();
-          console.log("[token-server] payload:", data);
-          const { token } = data;
-          if (!token) throw new Error("Token payload missing { token }");
+        // 2) Get **signed URL** (NEW)
+    setStatus("getting-token");
+    const resp = await fetch("https://token-server-omrd.onrender.com/api/webrtc-signed-url", { mode: "cors" });
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`Signed URL endpoint error (${resp.status}): ${t}`);
+    }
+    const { signed_url } = await resp.json();
+    if (!signed_url) throw new Error("Signed URL payload missing { signed_url }");
 
-          // 3) Start WebRTC session (SDK controls its own mic)
-          setStatus("connecting");
-          const session = await Eleven.Conversation.startSession({
-            connectionType: "webrtc",
-            conversationToken: token,
-            enableMicrophone: true
-          });
+    // 3) Start session with signed URL (NEW)
+    setStatus("connecting");
+    const session = await Eleven.Conversation.startSession({
+      connectionType: "webrtc",
+      signedUrl: signed_url
+    });
 
           // Optional: logs for debugging
           session.onStatusChange?.((s) => console.log("[sdk] status:", s));
