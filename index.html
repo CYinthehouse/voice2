@@ -12,35 +12,38 @@
   <script src="https://cdn.tailwindcss.com"></script>
 
   <!-- Robust SDK loader: tries multiple CDNs/versions and sets window.ElevenLabs -->
-  <script>
+  <script type="module">
     window.loadElevenLabsSDK = async function loadElevenLabsSDK() {
       if (window.ElevenLabs) return window.ElevenLabs;
 
-      // Known-working builds (as of now). We try modern ESM first, then UMD.
+      // Known-working builds (try ESM first, then UMD)
       const candidates = [
-        // jsDelivr 0.6.x (ESM modern)
+        // jsDelivr 0.6.x (ESM)
         "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.6.2/dist/lib.modern.js",
         "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.6.1/dist/lib.modern.js",
         "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.6.0/dist/lib.modern.js",
-        // jsDelivr 0.1.6 (ESM modern & UMD)
+        // jsDelivr 0.1.6 (ESM + UMD)
         "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.1.6/dist/lib.modern.js",
         "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.1.6/dist/lib.umd.js"
       ];
 
-      // Try dynamic import for ESM; if that fails, try script injection for UMD.
       const tryImport = async (url) => {
         if (url.endsWith(".umd.js")) return false; // skip import for UMD
         try {
-          const mod = await import(/* @vite-ignore */ url);
+          const mod = await import(url);
           window.ElevenLabs = mod || window.ElevenLabs;
           return !!window.ElevenLabs;
-        } catch { return false; }
+        } catch {
+          return false;
+        }
       };
 
       const tryScript = (url) => new Promise((resolve) => {
         const s = document.createElement("script");
-        s.src = url; s.async = true; s.onload = () => {
-          // UMD exposes a global. Package has exported as different names over time; check both.
+        s.src = url;
+        s.async = true;
+        s.onload = () => {
+          // Older UMDs exposed different globals; check all
           window.ElevenLabs = window.ElevenLabs || window.ElevenLabsClient || window.Eleven;
           resolve(!!window.ElevenLabs);
         };
@@ -48,16 +51,17 @@
         document.head.appendChild(s);
       });
 
-      const failures = [];
       for (const url of candidates) {
         let ok = await tryImport(url);
         if (!ok && url.endsWith(".umd.js")) ok = await tryScript(url);
-        if (ok && window.ElevenLabs?.Conversation?.startSession) return window.ElevenLabs;
-        failures.push(url);
+        if (ok && window.ElevenLabs?.Conversation?.startSession) {
+          console.log("[SDK] Loaded ElevenLabs from", url);
+          return window.ElevenLabs;
+        }
+        console.warn("[SDK] Failed from", url);
       }
-      const err = new Error("[SDK] Could not load ElevenLabs SDK from any CDN.");
-      err.failures = failures;
-      throw err;
+
+      throw new Error("[SDK] Could not load ElevenLabs SDK from any CDN.");
     };
   </script>
 
@@ -77,10 +81,7 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // ✅ Your agent ID (safe to expose)
-    const AGENT_ID = "agent_5001k5x6hf18fzs8bpph834q4ebg";
-
-    // ✅ Your Render backend (must match ALLOWED_ORIGINS on the server)
+    // Your Render backend token endpoint
     const TOKEN_ENDPOINT = "https://token-server-omrd.onrender.com/api/webrtc-token";
 
     function VoiceAgentContainer() {
@@ -104,11 +105,12 @@
       // ElevenLabs session
       const conversationRef = useRef(null);
 
+      // Format ms → mm:ss.mmm
       const fmt = (ms) => {
         const mm  = Math.floor(ms / 60000);
         const ss  = Math.floor((ms % 60000) / 1000);
         const ms3 = Math.floor(ms % 1000).toString().padStart(3, "0");
-        return \`\${mm}:\${ss.toString().padStart(2, "0")}.\${ms3}\`;
+        return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
       };
 
       // Simple VAD with hysteresis
@@ -212,7 +214,7 @@
           const resp = await fetch(TOKEN_ENDPOINT);
           if (!resp.ok) {
             const t = await resp.text();
-            throw new Error(\`Token endpoint error (\${resp.status}): \${t}\`);
+            throw new Error(`Token endpoint error (${resp.status}): ${t}`);
           }
           const { token } = await resp.json();
           if (!token) throw new Error("Token payload missing { token }");
@@ -357,8 +359,11 @@
 
       return (
         <div className="mt-2 h-8 flex items-center justify-center">
-          <div aria-hidden className="rounded-full transition-all duration-75"
-               style={{ width: r * 2, height: r * 2, background: "#111", opacity: 0.8 }} />
+          <div
+            aria-hidden
+            className="rounded-full transition-all duration-75"
+            style="{{ width: r * 2, height: r * 2, background: '#111', opacity: 0.8 }}"
+          ></div>
         </div>
       );
     }
