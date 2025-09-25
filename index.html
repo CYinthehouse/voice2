@@ -113,42 +113,42 @@
         return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
       };
 
-      // Simple VAD with hysteresis
-      const startVadLoop = () => {
-        const analyser = analyserRef.current;
-        if (!analyser) return;
+  // ====== VAD loop (start-once + continuous timer) ======
+const startVadLoop = () => {
+  const analyser = analyserRef.current;
+  if (!analyser) return;
 
-        const data = new Float32Array(analyser.fftSize);
-        const onThreshold  = 0.03;  // ~3% RMS
-        const offThreshold = 0.015; // lower to avoid flapping
+  const data = new Float32Array(analyser.fftSize);
+  const onThreshold  = 0.03;  // ~3% RMS
 
-        const loop = () => {
-          analyser.getFloatTimeDomainData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-          const rms = Math.sqrt(sum / data.length);
+  const loop = () => {
+    analyser.getFloatTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
 
-          if (!speakingRef.current && rms > onThreshold) {
-            speakingRef.current = true;
-            setSpeaking(true);
-            if (!speechStartedRef.current) speechStartedRef.current = performance.now();
-          }
+    // Start the timer the FIRST time we detect voice
+    if (!speakingRef.current && rms > onThreshold) {
+      speakingRef.current = true;
+      setSpeaking(true);
+      if (!speechStartedRef.current) {
+        speechStartedRef.current = performance.now();
+      }
+    }
 
-          if (speakingRef.current && rms < offThreshold) {
-            speakingRef.current = false;
-            setSpeaking(false);
-          }
+    // Once started, keep timer running continuously
+    if (speechStartedRef.current != null) {
+      const now = performance.now();
+      setElapsed(now - speechStartedRef.current);
+    }
 
-          if (speakingRef.current && speechStartedRef.current != null) {
-            const now = performance.now();
-            setElapsed(now - speechStartedRef.current);
-          }
+    // (We no longer set speaking=false on quiet — mic dot still animates fine)
+    rafRef.current = requestAnimationFrame(loop);
+  };
 
-          rafRef.current = requestAnimationFrame(loop);
-        };
+  rafRef.current = requestAnimationFrame(loop);
+};
 
-        rafRef.current = requestAnimationFrame(loop);
-      };
 
       const stopVadLoop = () => {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -194,48 +194,51 @@
         setElapsed(0);
       };
 
-      const handleStart = async () => {
-        setError(null);
-        setStatus("requesting-mic");
+const handleStart = async () => {
+  setError(null);
+  setStatus("requesting-mic");
 
-        try {
-          // 1) Mic
-          await setupAudioChain();
-          setStatus("loading-sdk");
+  try {
+    // ✅ 1) Load SDK *before* we touch the mic, so we can let SDK own it
+    setStatus("loading-sdk");
+    const Eleven = await window.loadElevenLabsSDK();
+    if (!Eleven?.Conversation?.startSession) {
+      throw new Error("ElevenLabs SDK loaded but Conversation.startSession is missing");
+    }
 
-          // 2) Load SDK via robust loader (sets window.ElevenLabs)
-          const Eleven = await window.loadElevenLabsSDK();
-          if (!Eleven?.Conversation?.startSession) {
-            throw new Error("ElevenLabs SDK loaded but Conversation.startSession is missing");
-          }
+    // ✅ 2) Get token
+    setStatus("getting-token");
+    const resp = await fetch(TOKEN_ENDPOINT);
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`Token endpoint error (${resp.status}): ${t}`);
+    }
+    const { token } = await resp.json();
+    if (!token) throw new Error("Token payload missing { token }");
 
-          // 3) Token from your Render backend
-          setStatus("getting-token");
-          const resp = await fetch(TOKEN_ENDPOINT);
-          if (!resp.ok) {
-            const t = await resp.text();
-            throw new Error(`Token endpoint error (${resp.status}): ${t}`);
-          }
-          const { token } = await resp.json();
-          if (!token) throw new Error("Token payload missing { token }");
+    // ✅ 3) Start WebRTC session (let SDK open mic itself)
+    setStatus("connecting");
+    const session = await Eleven.Conversation.startSession({
+      connectionType: "webrtc",
+      conversationToken: token,
+      // Some SDK builds accept this flag; harmless if ignored:
+      enableMicrophone: true
+    });
 
-          // 4) Start WebRTC session with token
-          setStatus("connecting");
-          const session = await Eleven.Conversation.startSession({
-            connectionType: "webrtc",
-            conversationToken: token
-          });
+    conversationRef.current = session;
 
-          conversationRef.current = session;
-          setConnected(true);
-          setStatus("connected");
-        } catch (e) {
-          console.warn("Start failed:", e);
-          setStatus("mock-mode");
-          setConnected(true); // keep UI usable
-          setError(e.message || String(e));
-        }
-      };
+    // ✅ 4) Now create *your own* analyser mic for the dot/timer (does not affect SDK)
+    await setupAudioChain();
+
+    setConnected(true);
+    setStatus("connected");
+  } catch (e) {
+    console.warn("Start failed:", e);
+    setStatus("mock-mode");
+    setConnected(true); // keep UI usable
+    setError(e.message || String(e));
+  }
+};
 
       const handleStop = async () => {
         try {
