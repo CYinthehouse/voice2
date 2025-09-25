@@ -41,6 +41,7 @@
             // Timer refs
             const speechStartedRef = useRef(null);
             const rafRef = useRef(null);
+            const speakingRef = useRef(false);
 
             // Audio + VAD refs
             const mediaStreamRef = useRef(null);
@@ -59,35 +60,36 @@
                 return `${mm}:${ss.toString().padStart(2, "0")}.${ms3}`;
             };
 
-            // ====== VAD loop (simple RMS threshold) ======
+            // ====== VAD loop (simple RMS with hysteresis) ======
             const startVadLoop = () => {
                 const analyser = analyserRef.current;
                 if (!analyser) return;
 
-                const data = new Uint8Array(analyser.fftSize);
-                const threshold = 10; // tweak as needed (0..255). ~10 is gentle.
+                const data = new Float32Array(analyser.fftSize);
+                const onThreshold = 0.03;   // ~3% RMS
+                const offThreshold = 0.015; // lower to avoid flapping
 
                 const loop = () => {
-                    analyser.getByteTimeDomainData(data);
-                    
-                    // RMS
+                    analyser.getFloatTimeDomainData(data);
                     let sum = 0;
-                    for (let i = 0; i < data.length; i++) {
-                        const centered = data[i] - 128;
-                        sum += centered * centered;
-                    }
+                    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
                     const rms = Math.sqrt(sum / data.length);
 
-                    // Start timer on first detected speech burst
-                    if (!speaking && rms > threshold) {
+                    // start on voice
+                    if (!speakingRef.current && rms > onThreshold) {
+                        speakingRef.current = true;
                         setSpeaking(true);
-                        if (!speechStartedRef.current) {
-                            speechStartedRef.current = performance.now();
-                        }
+                        if (!speechStartedRef.current) speechStartedRef.current = performance.now();
                     }
 
-                    // If speaking, update the elapsed timer
-                    if (speaking && speechStartedRef.current != null) {
+                    // optional: stop when quiet
+                    if (speakingRef.current && rms < offThreshold) {
+                        speakingRef.current = false;
+                        setSpeaking(false);
+                    }
+
+                    // If speaking, update the elapsed timer (use ref, not state!)
+                    if (speakingRef.current && speechStartedRef.current != null) {
                         const now = performance.now();
                         setElapsed(now - speechStartedRef.current);
                     }
@@ -110,6 +112,11 @@
 
                     const ctx = new (window.AudioContext || window.webkitAudioContext)();
                     audioCtxRef.current = ctx;
+
+                    // Important on Safari / suspended contexts:
+                    if (ctx.state === "suspended") {
+                        await ctx.resume();
+                    }
 
                     const analyser = ctx.createAnalyser();
                     analyser.fftSize = 1024; // fine for VAD
